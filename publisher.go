@@ -1,10 +1,12 @@
 package main
 
+type Message interface{}
+
 type Publisher interface {
 	Publish(Message) error
 }
 
-func NewNSQPublisher() {
+func NewNSQPublisher() Publisher {
 	return nil
 }
 
@@ -22,9 +24,16 @@ type sampledPublisher struct {
 }
 
 func NewBufferedPublisher(publisher Publisher, bufferSize int) Publisher {
-
+	return &bufferedPublisher{
+		buffer: make([]Message, 0, bufferSize),
+	}
 }
 
 type bufferedPublisher struct {
-	publisher
+	publisher Publisher
+	buffer    []Message
+}
+
+func (b *bufferedPublisher) Publish(Message) error {
+	return nil
 }

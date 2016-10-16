@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"time"
 )
@@ -14,15 +15,15 @@ type Server interface {
 	Stop() error
 }
 
-func NewServer(readDeadline time.Duration, receiverCh chan []byte) {
+func NewServer(readDeadline time.Duration, bytesCh chan []byte) Server {
 	return &udpServer{
-		receiverCh:   receiverCh,
+		bytesCh:      bytesCh,
 		readDeadline: readDeadline,
 	}
 }
 
 type udpServer struct {
-	receiverCh chan []byte
+	bytesCh chan []byte
 
 	// udp listener config
 	port         int
@@ -40,12 +41,12 @@ func (u *udpServer) ListenOnPort(port int) error {
 }
 
 func (u *udpServer) ListenAnywhere() error {
-	addr, err := net.ResolveUDPAddr("udp", "localhost")
+	addr, err := net.ResolveUDPAddr("udp", "localhost:0")
 	if err != nil {
 		return err
 	}
 
-	return nil
+	return u.start(addr)
 }
 
 func (u *udpServer) start(rawAddr *net.UDPAddr) error {
@@ -54,7 +55,7 @@ func (u *udpServer) start(rawAddr *net.UDPAddr) error {
 		return err
 	}
 
-	addr, ok := conn.LAddr().(*net.UDPAddr)
+	addr, ok := conn.LocalAddr().(*net.UDPAddr)
 	if !ok {
 		return errors.New("invalid connection")
 	}
@@ -62,26 +63,36 @@ func (u *udpServer) start(rawAddr *net.UDPAddr) error {
 	go func(conn *net.UDPConn) {
 		// create a buffer which can store the output of the
 		// largest acceptable, configured udp datagram
-		buf := make([]byte, 0, MAXUDPPayloadSize)
+		buf := make([]byte, MaxUDPPayloadSize)
 
 		for {
 			conn.SetReadDeadline(time.Now().Add(u.readDeadline))
 
-			bytesRead, originAddr, err := conn.ReadFromUDP(buf)
-			if err != nil {
-				// TODO: parse out errors that are related to
-				// the connection being closed and from a bad
-				// actor
+			bytesRead, _, err := conn.ReadFromUDP(buf)
+			if err == nil {
+				u.bytesCh <- buf[:bytesRead]
+				continue
 			}
 
-			// send the udp packets to a goroutine to be processed
-			// and parsed as a message
-			bytesCh <- buf[:bytesRead]
-		}
-	}()
+			if timeoutErr, ok := err.(net.Error); ok && timeoutErr.Timeout() {
+				continue
+			}
 
+			log.Println(err)
+		}
+	}(conn)
+
+	u.conn = conn
 	u.port = addr.Port
 	return nil
+}
+
+func (u *udpServer) Port() int {
+	if u.conn == nil {
+		log.Panicf("server not started")
+	}
+
+	return u.port
 }
 
 func (u *udpServer) Stop() error {
