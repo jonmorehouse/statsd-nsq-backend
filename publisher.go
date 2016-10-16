@@ -1,39 +1,91 @@
 package main
 
-type Message interface{}
+import (
+	"log"
+	"sync"
+	"time"
+
+	"github.com/nsqio/nsq"
+)
 
 type Publisher interface {
 	Publish(Message) error
+	Stop() error
 }
 
-func NewNSQPublisher() Publisher {
-	return nil
-}
+// NewBufferedNSQPublisher is responsible for buffering messages and flushing
+// them in batches to NSQ. This publisher accepts an NSQ producer connection
+// and uses that to write messages in batches.
+func NewBufferedNSQPublisher(bufferSize int, flushInterval time.Duration, topicName string, producer *nsq.Producer) Publisher {
+	publisher := &bufferedNSQPublisher{
+		messageCh:     make(chan Message, bufferSize/2),
+		bufferSize:    bufferSize,
+		flushInterval: flushInterval,
 
-// nsqPublisher is a publisher which emits messages to NSQ for each metric it
-type nsqPublisher struct {
-	//
-}
-
-func NewSampledPublisher(publisher Publisher, sampleRate float64) Publisher {
-	return nil
-}
-
-type sampledPublisher struct {
-	//
-}
-
-func NewBufferedPublisher(publisher Publisher, bufferSize int) Publisher {
-	return &bufferedPublisher{
-		buffer: make([]Message, 0, bufferSize),
+		topicName: topicName,
+		producer:  producer,
 	}
+	publisher.startLoop()
+	return publisher
 }
 
-type bufferedPublisher struct {
-	publisher Publisher
-	buffer    []Message
+type bufferedNSQPublisher struct {
+	messageCh     chan Message
+	flushInterval time.Duration
+	bufferSize    int
+
+	topicName string
+	producer  *nsq.Producer
+	wg        sync.WaitGroup
 }
 
-func (b *bufferedPublisher) Publish(Message) error {
+func (b *bufferedNSQPublisher) Publish(message Message) error {
+	b.messageCh <- message
 	return nil
+}
+
+func (b *bufferedNSQPublisher) startLoop() {
+	timer := time.NewTimer(b.flushInterval)
+	buf := make([]Message, b.bufferSize)
+	idx := 0
+
+	go func() {
+		for {
+			select {
+			case message, ok := <-b.messageCh:
+				if ok {
+					buf[idx] = message
+					idx++
+				}
+
+				if !ok || idx == len(buf) {
+					timer.Stop()
+					b.flush(buf[:idx])
+					idx = 0
+					timer.Reset(b.flushInterval)
+				}
+			case <-timer.C:
+				b.flush(buf[:idx])
+				idx = 0
+				timer.Reset(b.flushInterval)
+			}
+		}
+	}()
+}
+
+func (b *bufferedNSQPublisher) flush(msgs []Message) {
+	doneCh := make(chan *nsq.ProducerTransaction, 1)
+
+	// create a producer transaction and if no error was returned, wait in
+	// a goroutine until the transaction completes
+	if err := b.producer.MultiPublishAsync(b.topicName, byts, doneCh); err != nil {
+		log.Println(err)
+		return
+	}
+
+	b.wg.Add(1)
+	go func() {
+		<-doneCh
+		b.wg.Done()
+	}()
 }
