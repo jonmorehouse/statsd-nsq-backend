@@ -1,11 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"log"
 	"sync"
 	"time"
 
-	"github.com/nsqio/nsq"
+	nsq "github.com/nsqio/go-nsq"
 )
 
 type Publisher interface {
@@ -39,6 +40,13 @@ type bufferedNSQPublisher struct {
 	wg        sync.WaitGroup
 }
 
+func (b *bufferedNSQPublisher) Stop() error {
+	// closing this channel, results in a final flush occurring
+	close(b.messageCh)
+	b.wg.Wait()
+	return nil
+}
+
 func (b *bufferedNSQPublisher) Publish(message Message) error {
 	b.messageCh <- message
 	return nil
@@ -50,6 +58,15 @@ func (b *bufferedNSQPublisher) startLoop() {
 	idx := 0
 
 	go func() {
+		localFlush := func() {
+			timer.Stop()
+			if err := b.flush(buf[:idx]); err != nil {
+				log.Println("flush.error=" + err.Error())
+			}
+			idx = 0
+			timer.Reset(b.flushInterval)
+		}
+
 		for {
 			select {
 			case message, ok := <-b.messageCh:
@@ -57,30 +74,32 @@ func (b *bufferedNSQPublisher) startLoop() {
 					buf[idx] = message
 					idx++
 				}
-
 				if !ok || idx == len(buf) {
-					timer.Stop()
-					b.flush(buf[:idx])
-					idx = 0
-					timer.Reset(b.flushInterval)
+					localFlush()
 				}
 			case <-timer.C:
-				b.flush(buf[:idx])
-				idx = 0
-				timer.Reset(b.flushInterval)
+				localFlush()
 			}
 		}
 	}()
 }
 
-func (b *bufferedNSQPublisher) flush(msgs []Message) {
-	doneCh := make(chan *nsq.ProducerTransaction, 1)
+func (b *bufferedNSQPublisher) flush(msgs []Message) error {
+	// build out the messages JSON buffer
+	messageBodies := make([][]byte, len(msgs))
+	for idx, msg := range msgs {
+		jsonBytes, err := json.Marshal(msg)
+		if err != nil {
+			return err
+		}
+		messageBodies[idx] = jsonBytes
+	}
 
-	// create a producer transaction and if no error was returned, wait in
-	// a goroutine until the transaction completes
-	if err := b.producer.MultiPublishAsync(b.topicName, byts, doneCh); err != nil {
-		log.Println(err)
-		return
+	// publish the messages to NSQ via a producer transaction and when
+	// finished, update the global wait group.
+	doneCh := make(chan *nsq.ProducerTransaction, 1)
+	if err := b.producer.MultiPublishAsync(b.topicName, messageBodies, doneCh); err != nil {
+		return err
 	}
 
 	b.wg.Add(1)
@@ -88,4 +107,6 @@ func (b *bufferedNSQPublisher) flush(msgs []Message) {
 		<-doneCh
 		b.wg.Done()
 	}()
+
+	return nil
 }

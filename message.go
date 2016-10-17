@@ -1,38 +1,30 @@
 package main
 
 import (
-	"errors"
 	"strconv"
 	"strings"
-	"time"
 )
 
-const (
-	ErrInvalidMsg     = errors.New("E_INVALID_MSG")
-	ErrUnknownMsgType = errors.New("E_UNKNOWN_MSG_TYPE")
-)
-
-type Message interface {
-	Prefix() string
-	Key() string
-	Type() string
-	Value() interface{}
-	Tags() []string
-	SampleRate() float64
-
-	RawBytes() []byte
+type Message struct {
+	Prefix     string      `json:"prefix"`
+	Key        string      `json:"key"`
+	Type       string      `json:"type"`
+	Tags       []string    `json:"tags"`
+	SampleRate float64     `json:"sample_rate"`
+	Value      interface{} `json:"value"`
+	RawMsg     string      `json:"raw_message"`
 }
 
-func ParseMessage(byts []byte) (Message, error) {
+func ParseMessage(byts []byte) (*Message, error) {
 	str := string(byts)
-	pieces := strings.Split(str, "|", -1)
+	pieces := strings.Split(str, "|")
 
 	if len(pieces) < 2 {
 		return nil, ErrInvalidMsg
 	}
 
-	msg := &message{
-		rawMsg: str,
+	msg := &Message{
+		RawMsg: str,
 	}
 
 	var value interface{}
@@ -40,71 +32,57 @@ func ParseMessage(byts []byte) (Message, error) {
 
 	switch pieces[1] {
 	case "c":
-		msg.typ = "count"
+		msg.Type = "count"
 		value, err = strconv.Atoi(pieces[0])
 	case "ms":
-		msg.typ = "timing"
-		value, err = strconv.ParseFloat(pieces[1])
+		msg.Type = "timing"
+		value, err = strconv.ParseFloat(pieces[1], 64)
 	case "h":
-		msg.typ = "histogram"
-		value, err = strconv.ParseFloat(pieces[1])
+		msg.Type = "histogram"
+		value, err = strconv.ParseFloat(pieces[1], 64)
 
 	case "g":
-		msg.typ = "gauge"
-		value, err = strconv.ParseFloat(pieces[1])
+		msg.Type = "gauge"
+		value, err = strconv.ParseFloat(pieces[1], 64)
 	case "s":
-		msg.typ = "set"
+		msg.Type = "set"
 		value = pieces[1]
 	default:
 		return nil, ErrUnknownMsgType
 	}
 
-	// check for a prefix
-	keyPieces := strings.Split(pieces[0], ".", 1)
+	if err != nil {
+		return nil, ErrInvalidMsg
+	}
+
+	msg.Value = value
+
+	// check for a key prefix / namespace
+	keyPieces := strings.Split(pieces[0], ".")
 	if len(pieces) > 1 {
-		msg.prefix = keyPieces[0]
-		msg.key = keyPieces[1]
+		msg.Prefix = keyPieces[0]
+		msg.Key = keyPieces[1]
 	} else {
-		msg.prefix = ""
-		msg.key = keyPieces[0]
+		msg.Prefix = ""
+		msg.Key = keyPieces[0]
 	}
 
-	//
+	// for each piece available, check for additional, known datadog tags such as `|#` or `|h` (tags and hostname respectively)
 	for _, piece := range pieces {
-
+		// handle data dog tags
+		if strings.HasPrefix(piece, "|#") {
+			rawTags := strings.Split(piece, "|#")[1]
+			msg.Tags = strings.Split(rawTags, ",")
+		} else if strings.HasPrefix(piece, "|@") {
+			// handle encoded sample rate
+			rawSampleRate := strings.Split(piece, "|@")[1]
+			sampleRate, err := strconv.ParseFloat(rawSampleRate, 64)
+			if err != nil {
+				return nil, ErrInvalidMsg
+			}
+			msg.SampleRate = sampleRate
+		}
 	}
 
-}
-
-type message struct {
-	prefix, key, typ, rawMsg string
-	value                    interface{}
-
-	timestamp  time.Time
-	sampleRate float64
-	tags       []string
-}
-
-func (m *message) Prefix() string {
-	return m.prefix
-}
-
-func (m *message) Key() string {
-	return m.key
-}
-
-func (m *message) Type() string {
-	return m.typ
-}
-
-func (m *message) Value() interface{} {
-	return m.value
-}
-
-func (m *message) Tags() []string {
-	return m.tags
-}
-
-func (m *message) RawMessage() string {
-	return m.rawMsg
+	return msg, nil
 }
